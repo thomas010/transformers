@@ -252,23 +252,6 @@ class Trainer:
             by this function will be reflected in the predictions received by `compute_metrics`.
 
             Note that the labels (second parameter) will be `None` if the dataset does not have them.
-
-    Important attributes:
-
-        - **model** -- Always points to the core model. If using a transformers model, it will be a [`PreTrainedModel`]
-          subclass.
-        - **model_wrapped** -- Always points to the most external model in case one or more other modules wrap the
-          original model. This is the model that should be used for the forward pass. For example, under `DeepSpeed`,
-          the inner model is wrapped in `DeepSpeed` and then again in `torch.nn.DistributedDataParallel`. If the inner
-          model hasn't been wrapped, then `self.model_wrapped` is the same as `self.model`.
-        - **is_model_parallel** -- Whether or not a model has been switched to a model parallel mode (different from
-          data parallelism, this means some of the model layers are split on different GPUs).
-        - **place_model_on_device** -- Whether or not to automatically place the model on the device - it will be set
-          to `False` if model parallel or deepspeed is used, or if the default
-          `TrainingArguments.place_model_on_device` is overridden to return `False` .
-        - **is_in_train** -- Whether or not a model is currently running `train` (e.g. when `evaluate` is called while
-          in `train`)
-
     """
 
     from .trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
@@ -312,8 +295,10 @@ class Trainer:
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
 
-        # model = model.to(device)
+        if not args.deepspeed:
+            model = model.to(args.device)
 
+        # later use `self.model is self.model_wrapped` to check if it's wrapped or not
         # self.model_wrapped = model
         self.model = model
 
@@ -329,9 +314,12 @@ class Trainer:
         self.use_cpu_amp = False
 
         #
-        self.label_names = self.args.label_names
-        self._train_batch_size = args.train_batch_size
+        self.do_grad_scaling = False
+        self.label_smoother = None
+        default_label_names = find_labels(self.model.__class__)
+        self.label_names = default_label_names if self.args.label_names is None else self.args.label_names
 
+        self._train_batch_size = args.train_batch_size
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         #
@@ -457,9 +445,7 @@ class Trainer:
         """
         Setup the optimizer and the learning rate scheduler.
         """
-        self.create_optimizer()
-        self.create_scheduler(num_training_steps=num_training_steps, optimizer=self.optimizer)
-
+        # setup the optimizer
         args = self.args
         opt_model = self.model
 
@@ -495,13 +481,9 @@ class Trainer:
             from .optimization import AdamW
             optimizer_cls = AdamW
             optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == "adamw_apex_fused":
-            from apex.optimizers import FusedAdam
-            optimizer_cls = FusedAdam
-            optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.SGD:
+        elif args.optim == "sgd":
             optimizer_cls = torch.optim.SGD
-        elif args.optim == OptimizerNames.ADAGRAD:
+        elif args.optim == "adagrad":
             optimizer_cls = torch.optim.Adagrad
         else:
             raise ValueError(f"Trainer cannot instantiate unsupported optimizer: {args.optim}")
@@ -516,22 +498,6 @@ class Trainer:
             num_training_steps=num_training_steps,
         )
 
-        return  # anything needed
-
-    def num_examples(self, dataloader: DataLoader) -> int:
-        """
-        Helper to get number of samples in a [`~torch.utils.data.DataLoader`] by accessing its dataset. When
-        dataloader.dataset does not exist or has no length, estimates as best it can
-        """
-        try:
-            dataset = dataloader.dataset
-            # Special case for IterableDatasetShard, we need to dig deeper
-            if isinstance(dataset, IterableDatasetShard):
-                return len(dataloader.dataset.dataset)
-            return len(dataloader.dataset)
-        except (NameError, AttributeError, TypeError):  # no dataset or length, estimate by length of dataloader
-            return len(dataloader) * self.args.per_device_train_batch_size
-
     def _wrap_model(self, model, training=True, dataloader=None):
         """
         wrapping model for mixing precision, mutli-processing and distributed training
@@ -540,13 +506,18 @@ class Trainer:
         if self.deepspeed:
             return self.deepspeed
 
-        # mixed precision training with apex (torch < 1.6)
-        if self.use_apex and training:
-            model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
+        # train/eval could be run multiple-times - if already wrapped, don't re-wrap it again
+        if unwrap_model(model) is not model:
+            return model
 
         # multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
             model = nn.DataParallel(model)
+
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+        if not training:
+            return model
 
         # distributed training (should be after apex fp16 initialization)
         if self.args.local_rank != -1:
@@ -554,17 +525,20 @@ class Trainer:
             if self.args.ddp_find_unused_parameters is not None:
                 kwargs["find_unused_parameters"] = self.args.ddp_find_unused_parameters
             elif isinstance(model, PreTrainedModel):
+                # find_unused_parameters breaks checkpointing as per
+                # https://github.com/huggingface/transformers/pull/4659#issuecomment-643356021
                 kwargs["find_unused_parameters"] = not model.is_gradient_checkpointing
             else:
                 kwargs["find_unused_parameters"] = True
 
             if self.args.ddp_bucket_cap_mb is not None:
                 kwargs["bucket_cap_mb"] = self.args.ddp_bucket_cap_mb
-
+            if is_torch_neuroncore_available():
+                return model
             model = nn.parallel.DistributedDataParallel(
                 model,
-                device_ids=[self.args.local_rank],
-                output_device=self.args.local_rank,
+                device_ids=[self.args.local_rank] if self.args._n_gpu != 0 else None,
+                output_device=self.args.local_rank if self.args._n_gpu != 0 else None,
                 **kwargs,
             )
 
@@ -573,6 +547,7 @@ class Trainer:
     def train(
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
+        ignore_keys_for_eval: Optional[List[str]] = None,
         **kwargs,
     ):
         """
@@ -580,22 +555,26 @@ class Trainer:
 
         Args:
             resume_from_checkpoint (`str` or `bool`, *optional*):
-                `str`, local path to a saved checkpoint as saved by a previous instance of [`Trainer`].
+                local path to a saved checkpoint and resume from the model/optimizer/scheduler states loaded here.
+            ignore_keys_for_eval (`List[str]`, *optional*)
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions for evaluation during the training.
             kwargs:
                 Additional keyword arguments used to hide deprecated arguments
         """
-        #
         args = self.args
         #
-        self._train_batch_size = self.args.train_batch_size
         train_dataloader = self.get_train_dataloader()
+
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
         total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
 
+        len_dataloader = None
         if has_length(train_dataloader):
-            num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+            len_dataloader = len(train_dataloader)
+            num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
             if args.max_steps > 0:
                 max_steps = args.max_steps
@@ -613,7 +592,6 @@ class Trainer:
                 f" {args.max_steps}"
             )
 
-        #
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
                 self, num_training_steps=max_steps, resume_from_checkpoint=resume_from_checkpoint
@@ -624,18 +602,17 @@ class Trainer:
             self.optimizer = optimizer
             self.lr_scheduler = lr_scheduler
         else:
+            if resume_from_checkpoint is not None:
+                self._load_from_checkpoint(resume_from_checkpoint)
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+            if resume_from_checkpoint is not None:
+                self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        model = self._wrap_model(self.model_wrapped)
-        if model is not self.model:
-            self.model_wrapped = model
-
-        # Check if saved optimizer or scheduler states exist
-        self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        model = self._wrap_model(self.model)
 
         logger.info("***** Running training *****")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
@@ -643,25 +620,27 @@ class Trainer:
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size:,}")
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_steps:,}")
+        logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
         #
         start_time = time.time()
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
+        self.global_step = 0  # replace self.state.global_step
 
         # Check if continuing training from a checkpoint
         if resume_from_checkpoint is not None:
-            global_step = xxx  # from resume_from_checkpoint
-            epochs_trained = global_step // num_update_steps_per_epoch
-            steps_trained_in_current_epoch = global_step % (num_update_steps_per_epoch)
+            self.global_step = int(resume_from_checkpoint.split("-")[-1].split(os.path.sep)[0])
+            epochs_trained = self.global_step // num_update_steps_per_epoch
+            steps_trained_in_current_epoch = self.global_step % (num_update_steps_per_epoch)
             steps_trained_in_current_epoch *= args.gradient_accumulation_steps
             logger.info(f"  Continuing training from epoch {epochs_trained}")
-            logger.info(f"  Continuing training from global step {self.state.global_step}")
+            logger.info(f"  Continuing training from global step {self.global_step}")
 
-        #
+        # tr_loss is a tensor to avoid synchronization of TPUs through .item()
         tr_loss = torch.tensor(0.0).to(args.device)
         self._total_loss_scalar = 0.0
-        self._globalstep_last_logged = global_step
+        self._globalstep_last_logged = self.global_step
         model.zero_grad()
 
         total_batched_samples = 0
@@ -677,78 +656,87 @@ class Trainer:
             if args.past_index >= 0:
                 self._past = None
 
-            steps_in_epoch = (
-                len(train_dataloader)
-                if has_length(train_dataloader) is not None
-                else args.max_steps * args.gradient_accumulation_steps
-            )
-
-            for step, inputs in enumerate(train_dataloader):
+            step = -1
+            for step, inputs in enumerate(epoch_iterator):
                 total_batched_samples += 1
+
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
 
-                tr_loss_step = self.training_step(model, inputs)
+                # forward and backward
+                if (
+                    (total_batched_samples % args.gradient_accumulation_steps != 0)
+                    and args.local_rank != -1
+                    and args._no_sync_in_gradient_accumulation
+                ):
+                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                    with model.no_sync():
+                        tr_loss_step = self.training_step(model, inputs)
+                else:
+                    tr_loss_step = self.training_step(model, inputs)
 
                 tr_loss += tr_loss_step
 
-                # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
+                # deepspeed only update when we reach gradient accumulation boundaries
                 if self.deepspeed:
                     self.deepspeed.step()
 
                 if total_batched_samples % args.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:  # deepspeed does its own clipping
-                        if self.do_grad_scaling:
-                            self.scaler.unscale_(self.optimizer)
-
-                        # normal clipping, handling Apex or full precision
-                        nn.utils.clip_grad_norm_(
-                            amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                            args.max_grad_norm,
-                        )
-
-                    # Optimizer step
+                    # update the model
                     if self.deepspeed:
                         pass  # called outside the loop
-                    elif self.do_grad_scaling:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.lr_scheduler.step()
                     else:
-                        self.optimizer.step()
+                        # gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                            if self.do_grad_scaling:
+                                # AMP: gradients need unscaling
+                                self.scaler.unscale_(self.optimizer)
+                            nn.utils.clip_grad_norm_(
+                                amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                                args.max_grad_norm,
+                            )
+
+                        # optimizer step
+                        if self.do_grad_scaling:
+                            self.scaler.step(self.optimizer)  # unscale_ may be called explicitly between backward() and scaler.step(optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
+
+                        # lr_scheduler step
                         self.lr_scheduler.step()
 
                     model.zero_grad()
+                    self.global_step += 1
 
-                    # should log
-                    if self.state.global_step % args.log_steps == 0:
+                    # log if needed
+                    if self.global_step % args.logging_steps == 0:
                         # all_gather + mean() to get average loss over all processes
                         tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
                         tr_loss -= tr_loss  # reset tr_loss to zero
 
                         logs: Dict[str, float] = {}
-                        logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+                        logs["loss"] = round(tr_loss_scalar / (self.global_step - self._globalstep_last_logged), 4)
                         logs["learning_rate"] = self._get_learning_rate()
 
                         self._total_loss_scalar += tr_loss_scalar
-                        self._globalstep_last_logged = self.state.global_step
+                        self._globalstep_last_logged = self.global_step
 
                         self.log(logs)
 
-                    # should evaluate
-                    if self.state.global_step % args.eval_steps == 0:
-                        metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+                    # evaluate if needed
+                    if self.global_step % args.eval_steps == 0:
+                        metrics = self.evaluate()
                         self.log(metrics)
 
-                    # should save
-                    if self.state.global_step % args.save_steps == 0:
-                        self._save_checkpoint(model, trial, metrics=metrics)
+                    # save model if needed
+                    if self.global_step % args.save_steps == 0:
+                        self._save_checkpoint(model, metrics=metrics)
                 # step end <<
             # epoch end >>
-            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            metrics = self.evaluate()
             self.log(metrics)
             # epoch end <<
 
@@ -756,13 +744,11 @@ class Trainer:
         if args.past_index and hasattr(self, "_past"):
             delattr(self, "_past")
 
-        logger.info("\n\nTraining completed. ")
-
         # add remaining tr_loss
         self._total_loss_scalar += tr_loss.item()
-        train_loss = self._total_loss_scalar / self.state.global_step
+        train_loss = self._total_loss_scalar / self.global_step
 
-        metrics = speed_metrics("train", start_time, num_samples=num_train_samples, num_steps=self.state.max_steps)
+        #metrics = speed_metrics("train", start_time, num_samples=num_train_samples, num_steps=self.state.max_steps)
         metrics["train_loss"] = train_loss
         self.log(metrics)
 
@@ -770,19 +756,57 @@ class Trainer:
         checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
         # train end <<
 
-        return TrainOutput(self.state.global_step, train_loss, metrics)
+        return TrainOutput(self.global_step, train_loss, metrics)
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _load_from_checkpoint(self, resume_from_checkpoint):
+        model = self.model
+
+        config_file = os.path.join(resume_from_checkpoint, CONFIG_NAME)
+        weights_file = os.path.join(resume_from_checkpoint, WEIGHTS_NAME)
+        logger.info(f"Loading model from {resume_from_checkpoint}.")
+
+        config = PretrainedConfig.from_json_file(config_file)
+        state_dict = torch.load(weights_file, map_location="cpu")
+        load_result = model.load_state_dict(state_dict, False)
+        del state_dict
+
+        # _issue_warnings_after_load
+        if len(load_result.missing_keys) != 0:
+            if self.model._keys_to_ignore_on_save is not None and set(load_result.missing_keys) == set(
+                self.model._keys_to_ignore_on_save
+            ):
+                self.model.tie_weights()
+            else:
+                logger.warning(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
+        if len(load_result.unexpected_keys) != 0:
+            logger.warning(
+                f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}."
+            )
+
+    def _save_checkpoint(self, model, metrics=None):
         # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.global_step}"
         output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
-        self.save_model(output_dir, _internal_call=True)
-        if self.deepspeed:
-            # 1.under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
-            # config `stage3_gather_16bit_weights_on_model_save` is True
-            # 2.deepspeed.save_checkpoint saves model/optim/sched
-            self.deepspeed.save_checkpoint(output_dir)
-        else:
+        # save model
+        if self.args.process_index in [-1, 0]:
+            # execute on process zero
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info(f"Saving model checkpoint to {output_dir}")
+            self.tokenizer.save_pretrained(output_dir)
+            torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+            if not self.deepspeed:
+                self.model.save_pretrained(output_dir)
+
+        if self.deepspeed:  # for deepspeed, this must be called on all ranks
+            if is_deepspeed_zero3_enabled():
+                if not self.deepspeed.save_16bit_model(output_dir, WEIGHTS_NAME):
+                    self.deepspeed.save_checkpoint(output_dir)
+            else:
+                self.deepspeed.save_checkpoint(output_dir)
+
+        # Save optimizer and scheduler
+        if self.args.process_index in [-1, 0] and not self.deepspeed:
+            # deepspeed.save_checkpoint above saves model/optim/sched
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
             torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
             if self.do_grad_scaling:
@@ -790,15 +814,11 @@ class Trainer:
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         """If optimizer and scheduler states exist, load them."""
-        if checkpoint is None:
-            return
-        #
-        if self.deepspeed:
-            # deepspeed loads optimizer/lr_scheduler together with the model in deepspeed_init
-            return
-        else:
-            # Load in optimizer and scheduler states
-            # We use the CPU when training on one GPU and directly use each GPU in distributed training
+        checkpoint_file_exists = os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME))
+        if checkpoint_file_exists and os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
+            # We use the CPU when training on one GPU to avoid OOM for GPU RAM when training big models.
+            # In distributed training however, we load directly on each GPU and risk the GPU OOM as it's more
+            # likely to get OOM on CPU (since we load num_gpu times the optimizer state
             map_location = self.args.device if self.args.world_size > 1 else "cpu"
             self.optimizer.load_state_dict(
                 torch.load(os.path.join(checkpoint, OPTIMIZER_NAME), map_location=map_location)
@@ -810,19 +830,9 @@ class Trainer:
     def log(self, logs: Dict[str, float]) -> None:
         """
         Log `logs` on the various objects watching training.
-
-        Subclass and override this method to inject custom behavior.
-
-        Args:
-            logs (`Dict[str, float]`):
-                The values to log.
         """
-        if self.state.epoch is not None:
-            logs["epoch"] = round(self.state.epoch, 2)
-
-        output = {**logs, **{"step": self.state.global_step}}
-        self.state.log_history.append(output)
-        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+        output = {**logs, **{"step": self.global_step}}
+        logger.info(output)
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
@@ -879,12 +889,14 @@ class Trainer:
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # context_manager
-        loss = self.compute_loss(model, inputs)
+        outputs = model(**inputs)
 
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
+            loss = loss.mean()
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
@@ -902,94 +914,11 @@ class Trainer:
 
         return loss.detach()
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
-
-        Subclass and override for custom behavior.
-        """
-        if self.label_smoother is not None and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        outputs = model(**inputs)
-        # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
-        if self.args.past_index >= 0:
-            self._past = outputs[self.args.past_index]
-
-        if labels is not None:
-            if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                loss = self.label_smoother(outputs, labels, shift_labels=True)
-            else:
-                loss = self.label_smoother(outputs, labels)
-        else:
-            if isinstance(outputs, dict) and "loss" not in outputs:
-                raise ValueError(
-                    "The model did not return a loss from the inputs, only the following keys: "
-                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                )
-            # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        return (loss, outputs) if return_outputs else loss
-
     def is_local_process_zero(self) -> bool:
         return self.args.local_process_index == 0
 
     def is_world_process_zero(self) -> bool:
         return self.args.process_index == 0
-
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        """
-        Will save the model, so you can reload it using `from_pretrained()`.
-        """
-        if output_dir is None:
-            output_dir = self.args.output_dir
-
-        if self.deepspeed:
-            # this takes care of everything as long as we aren't under zero3
-            if self.args.should_save:
-                self._save(output_dir)
-
-            if is_deepspeed_zero3_enabled():
-                # It's too complicated to try to override different places where the weights dump gets
-                # saved, so since under zero3 the file is bogus, simply delete it. The user should
-                # either user deepspeed checkpoint to resume or to recover full weights use
-                # zero_to_fp32.py stored in the checkpoint.
-                if self.args.should_save:
-                    file = os.path.join(output_dir, WEIGHTS_NAME)
-                    if os.path.isfile(file):
-                        # logger.info(f"deepspeed zero3: removing {file}, see zero_to_fp32.py to recover weights")
-                        os.remove(file)
-
-                # now save the real model if stage3_gather_16bit_weights_on_model_save=True
-                # if false it will not be saved.
-                # This must be called on all ranks
-                if not self.deepspeed.save_16bit_model(output_dir, WEIGHTS_NAME):
-                    logger.warning(
-                        "deepspeed.save_16bit_model didn't save the model, since"
-                        " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
-                        " zero_to_fp32.py to recover weights"
-                    )
-                    self.deepspeed.save_checkpoint(output_dir)
-
-        elif self.args.should_save:
-            self._save(output_dir)
-
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        # If we are executing this function, we are the process zero, so we don't check for that.
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Saving model checkpoint to {output_dir}")
-
-        self.model.save_pretrained(
-            output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
-        )
-        self.tokenizer.save_pretrained(output_dir)
-
-        # Good practice: save your training arguments together with the trained model
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
     def _sorted_checkpoints(
         self, output_dir=None, checkpoint_prefix=PREFIX_CHECKPOINT_DIR, use_mtime=False
@@ -1047,13 +976,20 @@ class Trainer:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
-        test_dataloader = self.get_test_dataloader(test_dataset)
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
         output = self.evaluation_loop(
-            test_dataloader, description="Prediction", ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
+            eval_dataloader,
+            description="Evaluation",
+            # No point gathering the predictions if there are no metrics, otherwise we defer to
+            # self.args.prediction_loss_only
+            prediction_loss_only=True if self.compute_metrics is None else None,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
         )
+        self.log(output.metrics)
 
-        return PredictionOutput(predictions=output.predictions, label_ids=output.label_ids, metrics=output.metrics)
+        return output.metrics
 
     def predict(
         self, test_dataset: Dataset, ignore_keys: Optional[List[str]] = None, metric_key_prefix: str = "test"
@@ -1102,6 +1038,8 @@ class Trainer:
         model = self.model
         model.eval()
 
+        eval_dataset = getattr(dataloader, "dataset", None)
+
         if args.past_index >= 0:
             self._past = None
 
@@ -1143,6 +1081,8 @@ class Trainer:
             if logits is not None:
                 logits = self._pad_across_processes(logits)
                 logits = self._nested_gather(logits)
+                if self.preprocess_logits_for_metrics is not None:
+                    logits = self.preprocess_logits_for_metrics(logits, labels)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
@@ -1178,7 +1118,19 @@ class Trainer:
             all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
 
         # Number of samples
-        num_samples = observed_num_examples
+        if has_length(eval_dataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and getattr(eval_dataset, "num_examples", 0) > 0:
+            num_samples = eval_dataset.num_examples
+        else:
+            if has_length(dataloader):
+                num_samples = self.num_examples(dataloader)
+            else:  # both len(dataloader.dataset) and len(dataloader) fail
+                num_samples = observed_num_examples
+        if num_samples == 0 and observed_num_examples > 0:
+            num_samples = observed_num_examples
 
         # Number of losses has been rounded to a multiple of batch_size and in a distributed training, the number of
         # samplers has been rounded to a multiple of batch_size, so we truncate.
@@ -1196,6 +1148,9 @@ class Trainer:
             metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
         else:
             metrics = {}
+
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
 
         if all_losses is not None:
             metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
@@ -1266,57 +1221,47 @@ class Trainer:
         ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Perform an evaluation step on `model` using `inputs`.
-
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to evaluate.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-            prediction_loss_only (`bool`):
-                Whether or not to return the loss only.
-            ignore_keys (`List[str]`, *optional*):
-                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
-                gathering predictions.
-
-        Return:
-            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
-            logits and labels (each being optional).
+        perform an evaluation step on `model` using `inputs`
         """
         has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
 
         inputs = self._prepare_inputs(inputs)
+        ignore_keys = []
+        
+        if has_labels:
+            labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
+            if len(labels) == 1:
+                labels = labels[0]
+        else:
+            labels = None
 
         with torch.no_grad():
             if has_labels:
-                with self.compute_loss_context_manager():
-                    loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                outputs = model(**inputs)
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
                 loss = loss.mean().detach()
-
                 if isinstance(outputs, dict):
                     logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
                 else:
                     logits = outputs[1:]
+                #
+                if self.args.past_index >= 0:
+                    self._past = outputs[self.args.past_index]
             else:
                 loss = None
-                with self.compute_loss_context_manager():
-                    outputs = model(**inputs)
+                outputs = model(**inputs)
                 if isinstance(outputs, dict):
                     logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
                 else:
                     logits = outputs
-                # TODO: this needs to be fixed and made cleaner later.
+                #
                 if self.args.past_index >= 0:
                     self._past = outputs[self.args.past_index - 1]
 
         logits = nested_detach(logits)
 
-        return (loss, logits)
+        return (loss, logits, labels)
+
     def _gather_and_numpify(self, tensors, name):
         """
         Gather value of `tensors` (tensor or list/tuple of nested tensors) and convert them to numpy before
