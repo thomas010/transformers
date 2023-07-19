@@ -337,7 +337,7 @@ class Trainer:
                 seed=seed,
             )
 
-    def get_train_dataloader(self) -> DataLoader:
+    def get_train_dataloader(self, train_dataset: Optional[Dataset] = None) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
 
@@ -345,7 +345,7 @@ class Trainer:
         training if necessary) otherwise.
         """
 
-        train_dataset = self.train_dataset
+        train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         data_collator = self.data_collator
 
         if isinstance(train_dataset, torch.utils.data.IterableDataset):
@@ -976,20 +976,25 @@ class Trainer:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if not isinstance(eval_dataset, dict):
+            eval_dataset = {'': eval_dataset}
 
-        output = self.evaluation_loop(
-            eval_dataloader,
-            description="Evaluation",
-            # No point gathering the predictions if there are no metrics, otherwise we defer to
-            # self.args.prediction_loss_only
-            prediction_loss_only=True if self.compute_metrics is None else None,
-            ignore_keys=ignore_keys,
-            metric_key_prefix=metric_key_prefix,
-        )
-        self.log(output.metrics)
+        metrics = {}
+        for eval_dataset_name, eval_dataset in eval_dataset.items():
+            eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
-        return output.metrics
+            output = self.evaluation_loop(
+                eval_dataloader,
+                description="Evaluation",
+                # No point gathering the predictions if there are no metrics, otherwise we defer to
+                # self.args.prediction_loss_only
+                prediction_loss_only=True if self.compute_metrics is None else None,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+            )
+            metrics.update(output.metrics)
+        return metrics
 
     def predict(
         self, test_dataset: Dataset, ignore_keys: Optional[List[str]] = None, metric_key_prefix: str = "test"
