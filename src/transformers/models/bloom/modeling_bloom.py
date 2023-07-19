@@ -79,8 +79,14 @@ def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
     batch_size, src_length = mask.shape
     tgt_length = tgt_length if tgt_length is not None else src_length
 
-    expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
-    return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+    expanded_mask = (mask[:, None, None, :]==0).to(torch.bool)
+    expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+
+    inter_segment_mask = mask[:, None] != mask[None, :]
+    inter_segment_mask = torch.unsqueeze(inter_segment_mask, 1)  # decoder only
+
+    union_mask = expanded_mask | inter_segment_mask
+    return union_mask
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
