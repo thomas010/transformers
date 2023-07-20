@@ -705,23 +705,19 @@ class RemoveColumnsCollator:
 
 
 class MultiDataloader(object):
-    """ Wrap multi dataloaders to a single weighted dataloader"""
+    """ Wrap multi dataloaders to a single dataloader according to weights"""
     def __init__(self, dataloaders, weights, max_steps, seed):
-        self.dataloaders = dataloaders
+        weights = torch.tensor(weights, dtype=torch.float64)
+        weights /= torch.sum(weights)
+        generator = torch.Generator().manual_seed(seed)
+        self.dataloader_index = torch.multinomial(weights, max_steps, replacement=True, generator=generator)
+        self.dataloader_iters = [iter(dataloader) for dataloader in dataloaders]
         self.max_steps = max_steps
-
-        weights = np.array(weights, dtype=np.float64)
-        weights /= np.sum(weights)
-        gnr = torch.Generator()
-        gnr.manual_seed(seed)
-        self.dataloader_index = torch.multinomial(weights, max_steps, replacement=True, generator=gnr)
 
     def __len__(self):
         return self.max_steps
 
     def __iter__(self):
-        for i in range(self.max_steps):
-            index = self.dataloader_index[i]
-            dataloader = self.dataloaders[index]
-            batch = next(dataloader)
+        for index in self.dataloader_index:
+            batch = next(self.dataloader_iters[index])
             yield batch
