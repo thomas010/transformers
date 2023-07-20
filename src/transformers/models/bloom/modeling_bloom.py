@@ -82,7 +82,7 @@ def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
     expanded_mask = (mask[:, None, None, :]==0).to(torch.bool)
     expanded_mask.expand(batch_size, 1, tgt_length, src_length)
 
-    inter_segment_mask = mask[:, None] != mask[None, :]
+    inter_segment_mask = mask[:, :, None] != mask[:, None, :]
     inter_segment_mask = torch.unsqueeze(inter_segment_mask, 1)  # decoder only
 
     union_mask = expanded_mask | inter_segment_mask
