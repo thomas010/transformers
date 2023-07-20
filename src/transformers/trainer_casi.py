@@ -157,6 +157,7 @@ from .utils import (
     logging,
     strtobool,
 )
+from .data import IterableIndexDataset
 
 if is_apex_available():
     from apex import amp
@@ -349,7 +350,15 @@ class Trainer:
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         data_collator = self.data_collator
 
-        if isinstance(train_dataset, torch.utils.data.IterableDataset):
+        if isinstance(train_dataset, IterableIndexDataset):
+            return DataLoader(
+                train_dataset,
+                batch_size=self._train_batch_size,
+                collate_fn=data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+        elif isinstance(train_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
                 train_dataset = IterableDatasetShard(
                     train_dataset,
@@ -386,17 +395,24 @@ class Trainer:
         Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
         training if necessary) otherwise.
         """
+        train_dataset = train_dataset if train_dataset is not None else self.train_dataset
+        data_collator = self.data_collator
+
         dataloaders = []
         weights = []
-
-        for dataset, weight in enumerate(train_dataset):
-            train_dataset = dataset
-            data_collator = self.data_collator
-
-            if isinstance(train_dataset, torch.utils.data.IterableDataset):
+        for name, dataset, weight in train_dataset:
+            if isinstance(dataset, IterableIndexDataset):
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=self._train_batch_size,
+                    collate_fn=data_collator,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+            elif isinstance(dataset, torch.utils.data.IterableDataset):
                 if self.args.world_size > 1:
-                    train_dataset = IterableDatasetShard(
-                        train_dataset,
+                    dataset = IterableDatasetShard(
+                        dataset,
                         batch_size=self._train_batch_size,
                         drop_last=self.args.dataloader_drop_last,
                         num_processes=self.args.world_size,
@@ -404,7 +420,7 @@ class Trainer:
                     )
 
                 dataloader = DataLoader(
-                    train_dataset,
+                    dataset,
                     batch_size=self._train_batch_size,
                     collate_fn=data_collator,
                     num_workers=self.args.dataloader_num_workers,
@@ -413,7 +429,7 @@ class Trainer:
             else:
                 train_sampler = self._get_train_sampler()
                 dataloader = DataLoader(
-                    train_dataset,
+                    dataset,
                     batch_size=self._train_batch_size,
                     sampler=train_sampler,
                     collate_fn=data_collator,
@@ -422,13 +438,11 @@ class Trainer:
                     pin_memory=self.args.dataloader_pin_memory,
                     worker_init_fn=seed_worker,
                 )
-
+            #
             dataloaders.append(dataloader)
             weights.append(weight)
 
-        multidataloader = MultiDataloader(dataloaders, weights, self.args.max_steps, seed)
-
-        return multidataloader
+        return MultiDataloader(dataloaders, weights, self.args.max_steps, self.args.data_seed)
 
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
@@ -1034,12 +1048,11 @@ class Trainer:
         """
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if not isinstance(eval_dataset, list):
-            eval_dataset = [('', eval_dataset)]
+            eval_dataset = [(metric_key_prefix, eval_dataset, None)]
 
         metrics = {}
-        for eval_dataset_name, eval_dataset in eval_dataset:
-            eval_dataloader = self.get_eval_dataloader(eval_dataset)
-
+        for key_prefix, dataset, _ in eval_dataset:
+            eval_dataloader = self.get_eval_dataloader(dataset)
             output = self.evaluation_loop(
                 eval_dataloader,
                 description="Evaluation",
@@ -1047,7 +1060,7 @@ class Trainer:
                 # self.args.prediction_loss_only
                 prediction_loss_only=True if self.compute_metrics is None else None,
                 ignore_keys=ignore_keys,
-                metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                metric_key_prefix=key_prefix,
             )
             metrics.update(output.metrics)
         return metrics
