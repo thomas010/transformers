@@ -702,3 +702,26 @@ class RemoveColumnsCollator:
     def __call__(self, features: List[dict]):
         features = [self._remove_columns(feature) for feature in features]
         return self.data_collator(features)
+
+
+class MultiDataloader(object):
+    """ Wrap multi dataloaders to a single weighted dataloader"""
+    def __init__(self, dataloaders, weights, max_steps, seed):
+        self.dataloaders = dataloaders
+        self.max_steps = max_steps
+
+        weights = np.array(weights, dtype=np.float64)
+        weights /= np.sum(weights)
+        gnr = torch.Generator()
+        gnr.manual_seed(seed)
+        self.dataloader_index = torch.multinomial(weights, max_steps, replacement=True, generator=gnr)
+
+    def __len__(self):
+        return self.max_steps
+
+    def __iter__(self):
+        for i in range(self.max_steps):
+            index = self.dataloader_index[i]
+            dataloader = self.dataloaders[index]
+            batch = next(dataloader)
+            yield batch

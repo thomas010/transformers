@@ -131,6 +131,7 @@ from .trainer_utils import (
     seed_worker,
     set_seed,
     speed_metrics,
+    MultiDataloader,
 )
 from .training_args import OptimizerNames, ParallelMode, TrainingArguments
 from .utils import (
@@ -378,6 +379,58 @@ class Trainer:
                 worker_init_fn=seed_worker,
             )
 
+    def get_train_multidataloader(self, train_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
+        training if necessary) otherwise.
+        """
+        dataloaders = []
+        weights = []
+
+        for dataset, weight in enumerate(train_dataset):
+            train_dataset = dataset
+            data_collator = self.data_collator
+
+            if isinstance(train_dataset, torch.utils.data.IterableDataset):
+                if self.args.world_size > 1:
+                    train_dataset = IterableDatasetShard(
+                        train_dataset,
+                        batch_size=self._train_batch_size,
+                        drop_last=self.args.dataloader_drop_last,
+                        num_processes=self.args.world_size,
+                        process_index=self.args.process_index,
+                    )
+
+                dataloader = DataLoader(
+                    train_dataset,
+                    batch_size=self._train_batch_size,
+                    collate_fn=data_collator,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+            else:
+                train_sampler = self._get_train_sampler()
+                dataloader = DataLoader(
+                    train_dataset,
+                    batch_size=self._train_batch_size,
+                    sampler=train_sampler,
+                    collate_fn=data_collator,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                    worker_init_fn=seed_worker,
+                )
+
+            dataloaders.append(dataloader)
+            weights.append(weight)
+
+        multidataloader = MultiDataloader(dataloaders, weights, self.args.max_steps, seed)
+
+        return multidataloader
+
+
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
         """
         # reference to legacy prediction loop
@@ -564,7 +617,10 @@ class Trainer:
         """
         args = self.args
         #
-        train_dataloader = self.get_train_dataloader()
+        if not isinstance(self.train_dataset, list):
+            train_dataloader = self.get_train_dataloader()
+        else:
+            train_dataloader = self.get_train_multidataloader()
 
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
@@ -977,11 +1033,11 @@ class Trainer:
             dictionary also contains the epoch number which comes from the training state.
         """
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        if not isinstance(eval_dataset, dict):
-            eval_dataset = {'': eval_dataset}
+        if not isinstance(eval_dataset, list):
+            eval_dataset = [('', eval_dataset)]
 
         metrics = {}
-        for eval_dataset_name, eval_dataset in eval_dataset.items():
+        for eval_dataset_name, eval_dataset in eval_dataset:
             eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
             output = self.evaluation_loop(
