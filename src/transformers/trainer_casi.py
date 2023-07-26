@@ -803,7 +803,7 @@ class Trainer:
 
                     # save model if needed
                     if self.global_step % args.save_steps == 0:
-                        self._save_checkpoint(model, metrics=metrics)
+                        self._save_checkpoint(model)
                 # step end <<
             # epoch end >>
             metrics = self.evaluate()
