@@ -216,6 +216,7 @@ class IterableIndexDataset(torch.utils.data.IterableDataset):
                         length = length + rest
                         segment_id += 1
                         segment.append(np.ones((rest), dtype=np.int32) * segment_id)
+                        ptr = ptr + rest
 
 
 class MixedIterableIndexDataset(torch.utils.data.IterableDataset):
