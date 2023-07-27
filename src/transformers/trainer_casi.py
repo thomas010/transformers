@@ -157,7 +157,6 @@ from .utils import (
     logging,
     strtobool,
 )
-from .data import IterableIndexDataset
 
 if is_apex_available():
     from apex import amp
@@ -350,15 +349,7 @@ class Trainer:
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         data_collator = self.data_collator
 
-        if isinstance(train_dataset, IterableIndexDataset):
-            return DataLoader(
-                train_dataset,
-                batch_size=self._train_batch_size,
-                collate_fn=data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-        elif isinstance(train_dataset, torch.utils.data.IterableDataset):
+        if isinstance(train_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
                 train_dataset = IterableDatasetShard(
                     train_dataset,
@@ -401,15 +392,7 @@ class Trainer:
         dataloaders = []
         weights = []
         for name, dataset, weight in train_dataset:
-            if isinstance(dataset, IterableIndexDataset):
-                dataloader = DataLoader(
-                    dataset,
-                    batch_size=self._train_batch_size,
-                    collate_fn=data_collator,
-                    num_workers=self.args.dataloader_num_workers,
-                    pin_memory=self.args.dataloader_pin_memory,
-                )
-            elif isinstance(dataset, torch.utils.data.IterableDataset):
+            if isinstance(dataset, torch.utils.data.IterableDataset):
                 if self.args.world_size > 1:
                     dataset = IterableDatasetShard(
                         dataset,

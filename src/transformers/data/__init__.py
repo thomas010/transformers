@@ -42,4 +42,4 @@ from .processors import (
     xnli_processors,
     xnli_tasks_num_labels,
 )
-from .index_dataset import Index, IndexDataset, IterableIndexDataset
+from .index_dataset import Index, IndexDataset, SliceDataset

@@ -28,6 +28,10 @@ import time
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from .trainer_pt_utils import IterableDatasetShard
 
 from .utils import (
     ExplicitEnum,
@@ -707,17 +711,35 @@ class RemoveColumnsCollator:
 class MultiDataloader(object):
     """ Wrap multi dataloaders to a single dataloader according to weights"""
     def __init__(self, dataloaders, weights, max_steps, seed):
+        # setup epoch
+        self.dataloaders = dataloaders
+        epoch = 1
+        for dataloader in self.dataloaders:
+            if isinstance(dataloader, DataLoader) and isinstance(dataloader.sampler, DistributedSampler):
+                dataloader.sampler.set_epoch(epoch)
+            elif hasattr(dataloader, "dataset") and isinstance(dataloader.dataset, IterableDatasetShard):
+                dataloader.dataset.set_epoch(epoch)
+        # setup sampling index
         weights = torch.tensor(weights, dtype=torch.float64)
         weights /= torch.sum(weights)
         generator = torch.Generator().manual_seed(seed)
-        self.dataloader_index = torch.multinomial(weights, max_steps, replacement=True, generator=generator)
+        self.sampling_index = torch.multinomial(weights, max_steps, replacement=True, generator=generator)
+        #
         self.dataloader_iters = [iter(dataloader) for dataloader in dataloaders]
         self.max_steps = max_steps
 
-    def __len__(self):
-        return self.max_steps
-
     def __iter__(self):
-        for index in self.dataloader_index:
-            batch = next(self.dataloader_iters[index])
+        for index in self.sampling_index:
+            try:
+                batch = next(self.dataloader_iters[index])
+            except StopIteration:
+                dataloader = self.dataloaders[index]
+                if isinstance(dataloader, DataLoader) and isinstance(dataloader.sampler, DistributedSampler):
+                    epoch = dataloader.sampler.epoch + 1
+                    dataloader.sampler.set_epoch(epoch)
+                elif hasattr(dataloader, "dataset") and isinstance(dataloader.dataset, IterableDatasetShard):
+                    epoch = dataloader.dataset.epoch + 1
+                    dataloader.dataset.set_epoch(epoch)
+                self.dataloader_iters[index] = iter(dataloader)
+                batch = next(self.dataloader_iters[index])
             yield batch
