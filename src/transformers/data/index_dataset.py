@@ -162,7 +162,7 @@ class SliceDataset(torch.utils.data.Dataset):
         sum_sizes = np.sum(np.array(sizes, dtype=np.int64))
         num_slice = int(sum_sizes / slice_size)
         offsets = np.arange(num_slice, dtype=np.int64) * slice_size * np.int32().itemsize
-        offsets = offsets.to_list()
+        offsets = offsets.tolist()
         return offsets
 
     def __del__(self):
