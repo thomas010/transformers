@@ -425,7 +425,7 @@ class Trainer:
             dataloaders.append(dataloader)
             weights.append(weight)
 
-        return MultiDataloader(dataloaders, weights, self.args.max_steps, self.args.data_seed)
+        return MultiDataloader(dataloaders, weights, self.args.max_steps, self.args.gradient_accumulation_steps, self.args.data_seed)
 
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
