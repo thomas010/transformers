@@ -881,8 +881,9 @@ class Trainer:
         """
         Log `logs` on the various objects watching training.
         """
-        output = {**logs, **{"step": self.global_step}}
-        logger.info(output)
+        if self.is_local_process_zero():
+            output = {**logs, **{"step": self.global_step}}
+            logger.info(output)
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
