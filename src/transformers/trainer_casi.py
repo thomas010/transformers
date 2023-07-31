@@ -781,18 +781,15 @@ class Trainer:
 
                     # evaluate if needed
                     if self.global_step % args.eval_steps == 0:
-                        metrics = self.evaluate()
-                        self.log(metrics)
+                        if args.do_eval:
+                            metrics = self.evaluate()
+                            self.log(metrics)
 
                     # save model if needed
                     if self.global_step % args.save_steps == 0:
                         self._save_checkpoint(model)
                 # step end <<
             # epoch end >>
-            metrics = self.evaluate()
-            self.log(metrics)
-            # epoch end <<
-
         # train end >>
         if args.past_index and hasattr(self, "_past"):
             delattr(self, "_past")
