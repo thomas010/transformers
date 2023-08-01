@@ -177,6 +177,8 @@ if is_fairscale_available():
     from fairscale.optim import OSS
     from fairscale.optim.grad_scaler import ShardedGradScaler
 
+from .data.data_sampler import MultiSliceDataset
+
 
 logger = logging.get_logger(__name__)
 
@@ -349,7 +351,24 @@ class Trainer:
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
         data_collator = self.data_collator
 
-        if isinstance(train_dataset, torch.utils.data.IterableDataset):
+        if isinstance(train_dataset, MultiSliceDataset):
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.args.world_size,
+                rank=self.args.process_index,
+                shuffle=False,
+            )
+            return DataLoader(
+                train_dataset,
+                batch_size=self._train_batch_size,
+                sampler=train_sampler,
+                collate_fn=data_collator,
+                drop_last=self.args.dataloader_drop_last,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+                worker_init_fn=seed_worker,
+            )
+        elif isinstance(train_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
                 train_dataset = IterableDatasetShard(
                     train_dataset,

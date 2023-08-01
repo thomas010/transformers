@@ -17,9 +17,10 @@ import sys
 import os
 import math
 import struct
-from functools import lru_cache
 import numpy as np
 import torch
+from functools import lru_cache
+from .data_sampler import CyclicRandomSampler
 
 
 def _warmup_mmap_file(path):
@@ -184,3 +185,53 @@ class SliceDataset(torch.utils.data.Dataset):
                 'attention_mask': attention_mask,
                 'labels': data.copy().astype(np.int64)
                 }
+
+
+class MultiSliceDataset(torch.utils.data.Dataset):
+    def __init__(self, data_predixes, weights, num_samples, slice_size, eod_id, seed, warmup=True):
+        super().__init__()
+        assert len(data_predixes) == len(weights)
+        self.datasets = []
+        self.samplers = []
+        for data_predix in data_predixes:
+            dataset = SliceDataset(data_predix, slice_size, eod_id, warmup)
+            sampler = CyclicRandomSampler(dataset, seed)
+            self.datasets.append(dataset)
+            self.samplers.append(iter(sampler))
+        weights = torch.tensor(weights, dtype=torch.float64)
+        weights /= torch.sum(weights)
+        self.weights = weights
+        self.num_samples = num_samples
+        self.dataset_index, self.dataset_item_index = self.build_dataset_item_index()
+
+    def build_dataset_item_index(self):
+        dataset_index = []
+        dataset_item_index = []
+        num_datasets = len(self.datasets)
+        numbers = [0] * num_datasets
+        weights = self.weights
+        for i in range(self.num_samples):
+            min_index = 0
+            min_differ = numbers[0]/max(i, 1)-weights[0]
+            for j in range(1, num_datasets):
+                differ = numbers[j]/max(i, 1)-weights[j]
+                if differ < min_differ:
+                    min_index = j
+                    min_differ = differ
+            dataset_index.append(min_index)
+            dataset_item_index.append(next(self.samplers[min_index]))
+        return dataset_index, dataset_item_index
+
+    def __del__(self):
+        for dataset in self.datasets:
+            del dataset
+
+    def __len__(self):
+        return self.num_samples
+
+    # @lru_cache(maxsize=8)
+    def __getitem__(self, idx):
+        dataset_index = self.dataset_index[idx]
+        dataset_item_index = self.dataset_item_index[idx]
+        item = self.datasets[dataset_index][dataset_item_index]
+        return item
