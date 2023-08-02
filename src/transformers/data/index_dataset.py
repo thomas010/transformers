@@ -16,6 +16,7 @@
 import sys
 import os
 import math
+import time
 import struct
 import numpy as np
 import torch
@@ -202,7 +203,20 @@ class MultiSliceDataset(torch.utils.data.Dataset):
         weights /= torch.sum(weights)
         self.weights = weights
         self.num_samples = num_samples
-        self.dataset_index, self.dataset_item_index = self.build_dataset_item_index()
+        self.dataset_index, self.dataset_item_index = self.build_dataset_item_index_fast()
+
+    def build_dataset_item_index_fast(self):
+        start_time = time.time()
+        dataset_index = np.zeros(self.num_samples, dtype=np.uint8)
+        dataset_item_index = np.zeros(self.num_samples, dtype=np.int64)
+
+        from transformers.data import data_utils_cpp
+        data_utils_cpp.build_dataset_item_indices(dataset_index, self.weights, self.num_samples, True)
+        for i in range(self.num_samples):
+            index = dataset_index[i]
+            dataset_item_index[i] = next(self.samplers[index])
+        print('time for building multi slice datasets indices: {:.2f} (sec)'.format(time.time() - start_time))
+        return dataset_index, dataset_item_index
 
     def build_dataset_item_index(self):
         dataset_index = []
