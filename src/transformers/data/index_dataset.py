@@ -211,7 +211,7 @@ class MultiSliceDataset(torch.utils.data.Dataset):
         dataset_item_index = np.zeros(self.num_samples, dtype=np.int64)
 
         from transformers.data import data_utils_cpp
-        data_utils_cpp.build_dataset_item_indices(dataset_index, self.weights, self.num_samples, True)
+        data_utils_cpp.build_dataset_item_indices(dataset_index, self.weights, len(self.datasets), self.num_samples, True)
         for i in range(self.num_samples):
             index = dataset_index[i]
             dataset_item_index[i] = next(self.samplers[index])

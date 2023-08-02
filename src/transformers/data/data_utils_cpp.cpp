@@ -18,7 +18,7 @@ using namespace std;
 
 
 void build_dataset_item_indices(py::array_t<uint8_t>& dataset_index,
-			    const py::array_t<double>& weights,
+			    const py::array_t<double>& weights, int32_t num_datasets,
 			    const int64_t size, const bool verbose) {
   /* Given multiple datasets and a weighting array, build samples
    such that it follows those wieghts.*/
@@ -32,7 +32,6 @@ void build_dataset_item_indices(py::array_t<uint8_t>& dataset_index,
   auto weights_ptr = weights.unchecked<1>();
 
   // Initialize buffer for number of samples used for each dataset.
-  int32_t num_datasets = sizeof(weights)
   int64_t num_samples[num_datasets];
   for(int64_t i = 0; i < num_datasets; ++i) {
     num_samples[i] = 0;
@@ -72,4 +71,8 @@ void build_dataset_item_indices(py::array_t<uint8_t>& dataset_index,
     }
   }
 
+}
+
+PYBIND11_MODULE(data_utils_cpp, m) {
+    m.def("build_dataset_item_indices", &build_dataset_item_indices);
 }
