@@ -177,7 +177,7 @@ if is_fairscale_available():
     from fairscale.optim import OSS
     from fairscale.optim.grad_scaler import ShardedGradScaler
 
-from .data.data_sampler import MultiSliceDataset
+from .data import MultiSliceDataset
 
 
 logger = logging.get_logger(__name__)

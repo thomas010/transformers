@@ -85,7 +85,7 @@ class Index(object):
         self.doc_sizes = np.frombuffer(self.buffer, dtype=np.int32, count=self.num_doc,  offset=offset + self.sent_sizes.nbytes)
 
     def __del__(self):
-        if self.buffer_mmap:
+        if self.buffer_mmap is not None:
             self.buffer_mmap._mmap.close()
             del self.buffer_mmap
 
