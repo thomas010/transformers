@@ -203,7 +203,7 @@ class MultiSliceDataset(torch.utils.data.Dataset):
         weights /= torch.sum(weights)
         self.weights = weights
         self.num_samples = num_samples
-        self.dataset_index, self.dataset_item_index = self.build_dataset_item_index_fast()
+        self.dataset_index, self.dataset_item_index = self.build_dataset_item_index()
 
     def build_dataset_item_index_fast(self):
         start_time = time.time()
